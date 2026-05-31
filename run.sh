@@ -556,20 +556,6 @@ EOF
 EOF
   fi
 
-  cat >> "${SMARTDNS_CONF}" <<'EOF'
-# Disney+: disable IPv6 instead of routing through WARP
-address /disneyplus.com/#6
-address /disney-plus.net/#6
-address /dssott.com/#6
-address /bamgrid.com/#6
-address /registerdisney.go.com/#6
-address /braze.com/#6
-
-# Custom IPv6-disabled domains
-address /foosber.com/#6
-address /www.yuruyun.com/#6
-EOF
-
   touch /var/log/smartdns.log
   chmod 644 /var/log/smartdns.log
 }
