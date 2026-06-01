@@ -425,12 +425,10 @@ response-mode fastest-response
 cache-size 512
 rr-ttl 60
 bind [127.0.0.1]:53
-
 server 1.1.1.1 -bootstrap-dns -fallback
 server 8.8.8.8 -bootstrap-dns -fallback
 server-quic 8.8.8.8:853
 server-h3 h3://cloudflare-dns.com/dns-query
-server-https https://nrt.core.access.zznet.fun/dns-query -group 1stream -exclude-default-group
 
 EOF
 
