@@ -10,7 +10,7 @@ set -Eeuo pipefail
 #     1) dual  -> IPv4 + IPv6 policy routing
 #     2) ipv4  -> IPv4 only policy routing
 #     3) ipv6  -> IPv6 only policy routing
-#     4) none  -> only generate WireGuard config, no PostUp/PreDown hooks
+#     4) none  -> start plain WireGuard with automatic routes, no custom hooks
 # - Uses numeric routing table 250 for Debian 12 / Debian 13 compatibility
 # - In IPv6-enabled modes, adds high-metric IPv6 default route for: curl -6 --interface wg ...
 
@@ -63,9 +63,21 @@ select_stack_mode() {
         return 0
         ;;
       *)
-        warn "Invalid STACK_MODE from environment: ${STACK_MODE}"
+        err "Invalid STACK_MODE: ${STACK_MODE}. Use dual, ipv4, ipv6 or none."
+        exit 1
         ;;
     esac
+  fi
+
+  # With curl | bash, stdin contains the script, not keyboard input.
+  # Read from a dedicated terminal descriptor without consuming script bytes.
+  local input_fd
+  if [ -t 0 ]; then
+    exec {input_fd}<&0
+  elif ! { exec {input_fd}</dev/tty; } 2>/dev/null; then
+    err "No interactive terminal available. Set STACK_MODE=dual|ipv4|ipv6|none explicitly."
+    err "Example: curl -fsSL https://raw.githubusercontent.com/7HGRACE/WARP-Unlock/main/run.sh | STACK_MODE=ipv4 bash"
+    exit 1
   fi
 
   echo
@@ -73,12 +85,16 @@ select_stack_mode() {
   echo "  1) 双栈 IPv4 + IPv6 分流，推荐"
   echo "  2) 只启用 IPv4 分流"
   echo "  3) 只启用 IPv6 分流"
-  echo "  4) 不添加分流 hook，只生成普通 WireGuard 配置"
+  echo "  4) 普通 WireGuard 模式，自动配置路由并启动（可能接管双栈默认出口）"
   echo
 
   local choice
   while true; do
-    read -r -p "请输入选项 [1-4]，默认 1: " choice
+    if ! read -r -u "${input_fd}" -p "请输入选项 [1-4]，默认 1: " choice; then
+      exec {input_fd}<&-
+      err "Input ended before a mode was selected. Rerun interactively or set STACK_MODE explicitly."
+      exit 1
+    fi
     choice="${choice:-1}"
 
     case "${choice}" in
@@ -104,6 +120,7 @@ select_stack_mode() {
     esac
   done
 
+  exec {input_fd}<&-
   log "Selected stack mode: ${STACK_MODE}"
 }
 
