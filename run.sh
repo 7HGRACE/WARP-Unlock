@@ -319,21 +319,24 @@ filter_wireguard_addresses() {
     dual)
       cp "${input}" "${output}"
       ;;
-    ipv4)
-      # Keep only IPv4 Address lines.
-      awk '
-        /^Address *=/ {
-          if ($0 ~ /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/) print
-          next
-        }
-        { print }
-      ' "${input}" > "${output}"
-      ;;
-    ipv6)
-      # Keep only IPv6 Address lines.
-      awk '
-        /^Address *=/ {
-          if ($0 ~ /:/) print
+    ipv4|ipv6)
+      # wgcf may put both address families on one comma-separated line.
+      awk -v mode="${STACK_MODE}" '
+        /^[[:space:]]*Address[[:space:]]*=/ {
+          value = $0
+          sub(/^[^=]*=[[:space:]]*/, "", value)
+          sub(/[[:space:]]*[#;].*$/, "", value)
+          count = split(value, addresses, ",")
+          selected = ""
+          for (i = 1; i <= count; i++) {
+            address = addresses[i]
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", address)
+            if ((mode == "ipv4" && address ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) ||
+                (mode == "ipv6" && address ~ /:/)) {
+              selected = selected (selected == "" ? "" : ", ") address
+            }
+          }
+          if (selected != "") print "Address = " selected
           next
         }
         { print }
@@ -442,10 +445,10 @@ response-mode fastest-response
 cache-size 512
 rr-ttl 60
 bind [127.0.0.1]:53
-server 1.1.1.1 -bootstrap-dns -fallback
-server 8.8.8.8 -bootstrap-dns -fallback
-server-quic 8.8.8.8:853
-server-h3 h3://cloudflare-dns.com/dns-query
+# Use ordinary default-group upstreams supported by Debian SmartDNS 46.1.
+server 1.1.1.1
+server 8.8.8.8
+dualstack-ip-selection no
 
 EOF
 
@@ -732,66 +735,161 @@ enable_services() {
   systemctl restart "wg-quick@${WG_IF}"
 }
 
+# dig exits zero for DNS errors such as SERVFAIL: inspect status and answers.
+check_dns_answers() {
+  local family="$1" type="A" response answers
+  [ "$family" = 6 ] && type="AAAA"
+  if ! response="$(dig @127.0.0.1 youtube.com "$type" +time=3 +tries=1 +noall +comments +answer)"; then
+    return 1
+  fi
+  echo "$response"
+  if ! grep -q 'status: NOERROR' <<< "$response"; then
+    return 1
+  fi
+  answers="$(awk -v type="$type" '$4 == type { print $5 }' <<< "$response")"
+  if [ "$family" = 4 ]; then
+    CHECK_DNS4="$answers"
+    grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' <<< "$answers"
+  else
+    CHECK_DNS6="$answers"
+    grep -Eq '^[0-9a-fA-F:]+:[0-9a-fA-F:]*$' <<< "$answers"
+  fi
+}
+
+check_policy_route() {
+  local family="$1" rules routes mark_hex
+  mark_hex="$(printf '0x%x' "$MARK")"
+  rules="$(ip "-$family" -N rule show)" || return 1
+  routes="$(ip "-$family" route show table "$ROUTE_TABLE_ID")" || return 1
+  echo "$rules"
+  echo "$routes"
+  # Numeric output avoids false failures when table 250 has a name in rt_tables.
+  awk -v mark="$mark_hex" -v table="$ROUTE_TABLE_ID" '
+    {
+      marked = 0; routed = 0
+      for (i = 1; i < NF; i++) {
+        if ($i == "fwmark" && $(i+1) == mark) marked = 1
+        if ($i == "lookup" && $(i+1) == table) routed = 1
+      }
+      if (marked && routed) found = 1
+    }
+    END { exit !found }
+  ' <<< "$rules" || return 1
+  awk -v iface="$WG_IF" '
+    $1 == "default" {
+      for (i = 1; i < NF; i++) if ($i == "dev" && $(i+1) == iface) found = 1
+    }
+    END { exit !found }
+  ' <<< "$routes"
+}
+
+check_dns_ipset() {
+  local family="$1" set_name="warp" answers="$CHECK_DNS4" address
+  if [ "$family" = 6 ]; then
+    set_name="warp6"
+    answers="$CHECK_DNS6"
+  fi
+  [ -n "$answers" ] || return 1
+  ipset list "$set_name" || return 1
+  while IFS= read -r address; do
+    ipset test "$set_name" "$address" || return 1
+  done <<< "$answers"
+}
+
+check_warp_http() {
+  local family="$1" url="https://ipinfo.io/ip" address
+  [ "$family" = 6 ] && url="https://ip.sb"
+  address="$(curl "-$family" -fsS --connect-timeout 8 --max-time 20 \
+    --interface "$WG_IF" "$url")" || return 1
+  echo "$address"
+  if [ "$family" = 4 ]; then
+    grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' <<< "$address"
+  else
+    grep -Eq '^[0-9a-fA-F:]+:[0-9a-fA-F:]*$' <<< "$address"
+  fi
+}
+
+check_warp_handshake() {
+  local handshakes
+  handshakes="$(wg show "$WG_IF" latest-handshakes)" || return 1
+  echo "$handshakes"
+  awk '$2 ~ /^[0-9]+$/ && $2 > 0 { found = 1 } END { exit !found }' <<< "$handshakes"
+}
+
 run_checks() {
-  log "Running checks..."
+  log "Running checks for mode: ${STACK_MODE}..."
+  local failures=0 family firewall chain set_name service
+  CHECK_DNS4=""
+  CHECK_DNS6=""
 
-  echo
-  echo "===== Mode ====="
-  echo "STACK_MODE=${STACK_MODE}"
+  for service in smartdns "wg-quick@${WG_IF}"; do
+    if ! systemctl is-active --quiet "$service"; then
+      err "Service is not active: $service"
+      failures=$((failures + 1))
+    fi
+    if ! systemctl is-enabled --quiet "$service"; then
+      err "Service is not enabled: $service"
+      failures=$((failures + 1))
+    fi
+  done
 
-  echo
-  echo "===== WireGuard config addresses ====="
-  grep -E "^(Address|Table|PostUp|PreDown|Endpoint|AllowedIPs)" "${WG_CONF}" || true
-
-  echo
-  echo "===== WireGuard ====="
-  wg show || true
-
-  if want_ipv4; then
-    echo
-    echo "===== IPv4 policy routing ====="
-    ip rule | grep "lookup ${ROUTE_TABLE_ID}" || true
-    ip route show table "${ROUTE_TABLE_ID}" || true
+  if ! wg show "$WG_IF"; then
+    err "Cannot inspect WireGuard interface: ${WG_IF}"
+    failures=$((failures + 1))
   fi
 
-  if want_ipv6; then
-    echo
-    echo "===== IPv6 policy routing ====="
-    ip -6 rule | grep "lookup ${ROUTE_TABLE_ID}" || true
-    ip -6 route show table "${ROUTE_TABLE_ID}" || true
-    ip -6 route | grep "${WG_IF}" || true
+  for family in 4 6; do
+    # Plain mode retains both families and must test both tunnel exits.
+    if [ "$STACK_MODE" != none ]; then
+      if [ "$family" = 4 ] && ! want_ipv4; then continue; fi
+      if [ "$family" = 6 ] && ! want_ipv6; then continue; fi
+    fi
+
+    if ! check_dns_answers "$family"; then
+      err "SmartDNS IPv${family} lookup failed or returned no address."
+      failures=$((failures + 1))
+    fi
+
+    if want_hooks; then
+      if ! check_policy_route "$family"; then
+        err "IPv${family} policy rule or WARP default route is missing."
+        failures=$((failures + 1))
+      fi
+      if ! check_dns_ipset "$family"; then
+        err "IPv${family} DNS answers were not added to the routing ipset."
+        failures=$((failures + 1))
+      fi
+
+      firewall=iptables; chain=fwmark; set_name=warp
+      if [ "$family" = 6 ]; then
+        firewall=ip6tables; chain=fwmark6; set_name=warp6
+      fi
+      if ! "$firewall" -t mangle -C OUTPUT -j "$chain" ||
+         ! "$firewall" -t mangle -C PREROUTING -j "$chain" ||
+         ! "$firewall" -t mangle -C "$chain" -m set --match-set "$set_name" dst -j MARK --set-mark "$MARK" ||
+         ! "$firewall" -t nat -C POSTROUTING -m mark --mark "$MARK" -j MASQUERADE; then
+        err "IPv${family} marking or NAT rules are missing."
+        failures=$((failures + 1))
+      fi
+    fi
+
+    if ! check_warp_http "$family"; then
+      err "IPv${family} WARP HTTP probe failed or returned no IP address."
+      failures=$((failures + 1))
+    fi
+  done
+
+  # Probe traffic above should have caused a handshake, not merely created wg.
+  if ! check_warp_handshake; then
+    err "No completed WARP handshake was observed."
+    failures=$((failures + 1))
   fi
 
-  echo
-  echo "===== SmartDNS test ====="
-  dig @127.0.0.1 youtube.com A +short || true
-  dig @127.0.0.1 youtube.com AAAA +short || true
-
-  if want_ipv4; then
-    echo
-    echo "===== ipset warp ====="
-    ipset list warp 2>/dev/null | sed -n '1,20p' || true
-    echo
-    echo "===== IPv4 mangle counters ====="
-    iptables -t mangle -vnL fwmark 2>/dev/null || true
-    echo
-    echo "===== IPv4 curl test ====="
-    curl -4 --connect-timeout 8 https://ipinfo.io --interface "${WG_IF}" || true
-    echo
+  if [ "$failures" -ne 0 ]; then
+    err "${failures} check(s) failed. Installation is not verified."
+    return 1
   fi
-
-  if want_ipv6; then
-    echo
-    echo "===== ipset warp6 ====="
-    ipset list warp6 2>/dev/null | sed -n '1,20p' || true
-    echo
-    echo "===== IPv6 mangle counters ====="
-    ip6tables -t mangle -vnL fwmark6 2>/dev/null || true
-    echo
-    echo "===== IPv6 curl test ====="
-    curl -6 --connect-timeout 8 https://ip.sb --interface "${WG_IF}" || true
-    echo
-  fi
+  log "Required DNS, routing and tunnel checks passed."
 }
 
 main() {
@@ -807,7 +905,10 @@ main() {
   write_smartdns_conf
   write_wireguard_hooks
   enable_services
-  run_checks
+  if ! run_checks; then
+    err "Configuration was installed, but verification failed. Inspect services and network rules before use."
+    return 1
+  fi
 
   echo
   log "Done."
@@ -819,3 +920,4 @@ main() {
 }
 
 main "$@"
+

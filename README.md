@@ -9,7 +9,7 @@
 - 使用 apt 和 systemd 的 Debian/Ubuntu 系统；主脚本采用数字路由表 ID，以兼容 Debian 12/13 的配置方式。
 - root 权限、amd64 或 arm64 架构，以及可用的内核 WireGuard 支持。
 - 能访问软件源、GitHub、WARP 注册接口和隧道端点。
-- 本仓库的菜单回归测试不等同于所有系统上的完整联网安装验证。
+- 本地测试覆盖菜单、配置生成及故障模拟；真实 WARP 握手、分流和流媒体解锁仍需在允许创建网络接口的环境中验证。
 
 ## 安装
 
@@ -65,6 +65,8 @@ curl -fsSL https://raw.githubusercontent.com/7HGRACE/WARP-Unlock/main/run.sh | S
 
 默认包含 Netflix、Google/YouTube 的部分域名，以及 `ipinfo.io`、`ip.sb`、`cloudflare.com` 等测试域名。准确列表见 `run.sh` 中的 `write_smartdns_conf`。可编辑 `/etc/smartdns/smartdns.conf` 后执行 `systemctl restart smartdns`；重新运行安装脚本会重写该配置（旧配置会备份）。
 
+默认上游为普通 DNS `1.1.1.1` 和 `8.8.8.8`，使用 Debian SmartDNS 46.1 支持的 `server` 指令，并关闭双栈地址优选以分别处理 A/AAAA。配置不依赖 QUIC/H3 或仅用于 bootstrap 的上游。需要加密 DNS 时可按实际 SmartDNS 版本配置受支持的上游，并重新验证解析。
+
 分流实际按 IP 匹配。绕过 SmartDNS 的应用、自带 DoH 的客户端或直接访问 IP 的连接，可能无法触发规则；共享同一 IP 的其他网站也可能被分流。作为网关使用时，还需要自行确保客户端 DNS 路径、转发防火墙及相关网络配置正确。
 
 **IPv6 默认路由：** `dual` 和 `ipv6` 模式还会向主路由表添加 `default dev wg metric 4096`，用于绑定接口的 IPv6 连通性测试。如果没有更优的 IPv6 默认路由，未列入分流规则的 IPv6 流量也可能使用 WARP。因此这两个模式并非严格的“仅指定域名走 WARP”。
@@ -80,6 +82,10 @@ curl -fsSL https://raw.githubusercontent.com/7HGRACE/WARP-Unlock/main/run.sh | S
 已有自定义 DNS、防火墙或策略路由的机器应检查这些配置是否冲突。hook 文件、集合和链名是固定的，不能仅靠修改 `WG_IF` 部署多套互不干扰的实例。重复运行或切换模式也不等同于自动迁移旧规则。
 
 ## 检查与排错
+
+安装后的关键自检包括：服务运行及开机启动状态、指定接口是否存在、DNS 的 NOERROR 状态和实际地址、所选地址族的策略规则/默认路由、DNS 地址是否进入 ipset、标记及 NAT 规则、绑定 WARP 接口的 HTTP 出口探测，以及是否发生过 WireGuard 握手。`none` 模式检查双栈 DNS 和隧道出口，不要求自定义分流规则。
+
+任一关键检查失败，脚本会汇总错误、返回非零退出码，并且不输出 `Done`。例如 `dig` 即使退出码为 0，也可能返回 SERVFAIL；自检会检查响应内容。HTTP 探测启用错误状态检测及总超时。检查失败不会自动回滚已安装配置，不能把非零退出码视作“系统未发生修改”。这些检查不代表已验证网关转发或流媒体解锁。
 
 默认接口名为 `wg`；自定义接口时相应替换：
 
@@ -134,12 +140,21 @@ systemctl disable --now wg-quick@wg
 
 以上独立工具不会由当前主脚本自动启用。
 
-## 本地菜单测试
+## 本地回归测试
 
 ```bash
-python3 tests/test_menu.py
+python3 -m unittest discover -s tests -v
 ```
 
-测试仅提取并运行菜单相关代码，通过伪终端复现管道执行，不安装软件、不更改系统网络。
+测试提取脚本函数，通过伪终端检查菜单，在临时目录检查四种模式、单栈逗号/多行地址、Endpoint 覆盖及配置权限，并模拟 DNS SERVFAIL、空响应、缺失路由/标记/ipset、无握手和所有关键命令失败。不会运行安装器或更改系统网络。
+
+可选的真实 SmartDNS 测试会启动独立前台进程，把生成配置的监听端口、日志及默认上游重定向到临时文件和本机高端口，使用本机 UDP 上游返回 A/AAAA。它无需外网、WireGuard 或 root；未找到 SmartDNS 时明确跳过，不算验证通过。可指定 Debian 13 官方 46.1 的已安装或解包后的二进制：
+
+```bash
+SMARTDNS_BIN=/path/to/smartdns python3 -m unittest discover -s tests -v
+```
+
+复测时请记录 SmartDNS 版本、测试通过/跳过项目和退出码，并单独说明是否验证真实公网 DNS、WARP 握手、IPv4/IPv6 分流及流媒体访问。禁止创建网络接口的环境只能验证配置和模拟结果，不能据此宣称隧道正常可用。
 
 项目源自 [acacia233/Project-WARP-Unlock](https://github.com/acacia233/Project-WARP-Unlock)。
+
